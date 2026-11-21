@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run release tests
+        run: cargo test --release --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          $asset = "release-assets/clipcascade-lite-windows-x86_64.exe"
+          Copy-Item -LiteralPath "target/release/clipcascade-lite.exe" -Destination $asset -Force
+          $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "release-assets/SHA256SUMS.txt" -Value "$hash  clipcascade-lite-windows-x86_64.exe" -Encoding ascii -NoNewline
+          "SHA256=$hash" >> $env:GITHUB_ENV
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $notes = @'
+          ### Downloads
+          - `clipcascade-lite-windows-x86_64.exe` (standalone Windows x64 executable)
+          - SHA-256: `__SHA256__`
+
+          ### License
+          GNU General Public License v3.0 ([LICENSE](https://github.com/__REPO__/blob/__TAG__/LICENSE))
+          '@.Replace('__SHA256__', $env:SHA256).Replace('__REPO__', '${{ github.repository }}').Replace('__TAG__', $tag)
+          Set-Content -LiteralPath "release-assets/notes.md" -Value $notes -Encoding utf8
+          gh release create $tag `
+            "release-assets/clipcascade-lite-windows-x86_64.exe" `
+            "release-assets/SHA256SUMS.txt" `
+            --title "ClipCascade Lite $tag" `
+            --notes-file "release-assets/notes.md" `
+            --generate-notes

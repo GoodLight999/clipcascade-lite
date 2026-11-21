@@ -1,40 +1,81 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<img src="assets/icon.svg" width="64" height="64" alt="ClipCascade Lite icon">
 
 # ClipCascade Lite
 
-RustとWin32で作った、既存の [ClipCascade](https://github.com/Sathvik-Rao/ClipCascade) サーバーに接続する超軽量Windowsクライアントです。サーバーの設定に合わせてP2PとP2Sを自動で切り替えます。
+English | [日本語](README.ja.md)
 
-> **注意**：本ソフトウェアは第三者による**非公式（Unofficial）クライアント**です。公式の ClipCascade プロジェクトおよび開発者とは無関係であり、プロトコル互換の独立実装として作成しています。
+[![CI](https://github.com/GoodLight999/clipcascade-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/GoodLight999/clipcascade-lite/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/GoodLight999/clipcascade-lite)](https://github.com/GoodLight999/clipcascade-lite/releases)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-## Windowsで使う
+An ultra-lightweight Windows desktop client built with **Rust** and native **Win32 API**, protocol-compatible with [ClipCascade](https://github.com/Sathvik-Rao/ClipCascade) servers. It automatically detects and switches between **P2P (WebRTC)** and **P2S (STOMP relay)** modes.
 
-1. `cargo build --release --locked` でビルドし、`target\release\clipcascade-lite.exe` を開きます。
-2. 初回はメイン画面にサーバーのURLとユーザー名を入力し、「設定を保存」を選びます。保存済みパスワードや公式版の保存セッションを利用できる場合は、パスワード欄を空のまま接続できます。
-3. 暗号化、ソルト、鍵導出の反復回数を相手端末と揃えて「接続」を選びます。Android側では公式アプリの「Start sync」で同期を開始します。
-4. P2Pでは接続端末が現れると、P2Sではサーバー中継に接続すると、Windowsでコピーしたテキスト、画像、複数ファイルを同期できます。Androidからは公式アプリの共有操作も使えます。Windowsで受信したファイルは、設定したフォルダーの下に受信単位で保存され、エクスプローラーに貼り付けられます。
+> **Disclaimer**: This is an **unofficial**, independent third-party client. It is not affiliated with or endorsed by the official ClipCascade project or its author.
 
-メイン画面から切断、一時停止・再開、現在のクリップボードの手動送信、保存先の表示、設定保存ができます。「トレイへ」で同期を続けながらウィンドウを隠し、トレイアイコンから開き直せます。ウィンドウを閉じると終了します。設定は `%LOCALAPPDATA%\ClipCascade Lite\settings.json` に保存します。
+## Features
 
-「パスワードを保存」をオンにしてパスワードを入力し、接続に成功すると、Windows資格情報マネージャーにサーバー・ユーザー名ごとに保存します。次回起動時は保存済み設定とパスワードが揃っていれば自動で接続を開始します。「保存済みパスワードを削除」は表示中のサーバーとユーザー名に対応する資格情報を削除します。
+- **Native Rust + Win32 GUI**: Single standalone executable with minimal memory and CPU footprint.
+- **Full ClipCascade Protocol Compatibility**:
+  - Automatic **P2P** (WebRTC DataChannel) and **P2S** (STOMP over WebSocket) mode detection.
+  - Supports both **CCB1 binary framing** and legacy JSON format.
+  - Optional **end-to-end encryption** (AES-256-GCM + PBKDF2-HMAC-SHA256) matching the official clients.
+  - Bidirectional sync for **text**, **images**, and **multiple files** (received files are saved per transfer and placed on the Windows clipboard for direct paste in Explorer).
+- **Fast P2P Auto-Recovery**: Detects stalled or failed WebRTC handshakes quickly and automatically retries or rejoins signaling.
+- **Seamless Everyday Use**:
+  - Stores credentials securely in **Windows Credential Manager** (scoped per server URL and username).
+  - **Auto-connect on launch** when server URL, username, and a saved password are present.
+  - System tray minimization, pause/resume, manual send, in-session **sync history** preview (text & image), and **diagnostic/debug logs**.
+  - Custom PEM CA certificate support for self-hosted servers.
 
-Liteで使用できるパスワードが未入力かつ保存されていない場合、環境変数 `CLIPCASCADE_OFFICIAL_DATA` に公式版の `DATA` ファイルパスを指定していれば、有効な公式版セッションを再利用できます。
+## Installation
 
-画像・ファイルの同期、転送上限、保存先、カスタムCA証明書（PEM）は接続前に設定できます。転送上限は既定で32 MiB、最大256 MiBです。
+### Download a Prebuilt Binary
 
-「同期履歴」では送信・受信したテキストと画像を時刻順に選び、内容をプレビューできます。履歴は起動中の最新60件かつ合計16 MiBまで保持し、画面から消去できます。
+1. Download `clipcascade-lite-windows-x86_64.exe` from [GitHub Releases](https://github.com/GoodLight999/clipcascade-lite/releases).
+2. Place it in any folder and run it (no installer required).
 
-「診断ログ」には日時、接続状態、転送結果、エラーを記録します。最新300件を画面に表示し、`%LOCALAPPDATA%\ClipCascade Lite\logs` に約512 KiBずつの現行・前回ファイル（`diagnostic.log`）と、詳細な接続解析用のデバッグログ（`debug.log`、クリップボード内容や認証情報は含みません）を保存します。診断ログ画面から保存フォルダーを開けます。
+### Build from Source
 
-公式サーバーのP2Pモードでは、サーバーが接続の仲介を行い、クリップボードデータは端末間で直接転送します。P2S（Peer-to-Server）モードでは、サーバーが各端末のデータを中継します。P2Sではサーバー側の転送上限も適用されます。
+Requires the [Rust toolchain](https://rustup.rs/) on Windows:
 
-## 検証
+```powershell
+cargo build --release --locked
+```
 
-`cargo test --release --locked` で、従来JSONとCCB1の各形式について、暗号化の有無、分割転送、破損した暗号化データの拒否を検証します。
+The compiled executable will be at `target\release\clipcascade-lite.exe`.
 
-公式Android版との相互接続テストは隔離した検証環境用です。公式サーバーをループバックの18765番で検証したいモードに設定し、初期アカウントでログインした公式Androidアプリを同じサーバーへ接続します。Windows側で環境変数 `CLIPCASCADE_ANDROID_INTEROP=1` を指定して `cargo test --release --locked official_android_interop -- --ignored --nocapture` を実行します。
+## Usage
 
-Androidから `android-to-rust-351`、2×2のPNG（左上RGBAは `231,21,55,255`）、`android-a.txt`（内容は `android file a`）と `android-b.bin`（`0xD2` を57,000バイト）を順に共有します。各転送後に、Androidで返信を受信できたことを確認します。最後に `rust-a.txt` と `rust-b.bin` をAndroidで保存して内容を確認し、`downloaded-rust-files-351` を共有するとテストが完了します。
+1. Launch `clipcascade-lite.exe` and enter your ClipCascade server URL, username, and password.
+2. Match your encryption settings (E2E encryption toggle, salt, PBKDF2 hash rounds) with your other devices (such as the official Android app).
+3. Click **保存** (Save) and **接続** (Connect).
+   - With **パスワードを保存** (Remember password) enabled, the password is saved in Windows Credential Manager upon successful login, and subsequent launches will connect automatically.
+   - If you prefer reusing an existing official ClipCascade desktop session without entering a password, you can set the optional `CLIPCASCADE_OFFICIAL_DATA` environment variable to the path of the official client's `DATA` file.
+4. Once connected (peer count ≥ 1 in P2P mode, or relay connected in P2S mode), copying text, images, or files syncs automatically.
 
-## ライセンス
+> Note: The desktop GUI is currently localized in Japanese.
 
-[GNU General Public License v3.0](LICENSE) の下で公開しています。プロトコル互換のクライアントとして [Sathvik-Rao/ClipCascade](https://github.com/Sathvik-Rao/ClipCascade) に対応しています。
+## Settings & Logs
+
+- **Settings**: `%LOCALAPPDATA%\ClipCascade Lite\settings.json`
+- **Credentials**: Windows Credential Manager (`ClipCascade Lite/<sha256>`)
+- **Logs**: `%LOCALAPPDATA%\ClipCascade Lite\logs\`
+  - `diagnostic.log` (+ `diagnostic.previous.log`, ~512 KiB rotation): user-facing connection & transfer log (also shown in the **診断ログ** tab, latest 300 entries).
+  - `debug.log` (+ `debug.previous.log`, ~1 MiB rotation): detailed signaling/WebRTC state transitions for troubleshooting. Passwords, keys, public IPs, and clipboard contents are never written to logs.
+- **Sync History**: Held in memory only (up to 60 items / 16 MiB) and cleared on exit.
+- **Transfer Limit**: Default 32 MiB, configurable up to 256 MiB (server limits also apply in P2S mode).
+
+## Testing
+
+Run the unit and local P2P loopback tests:
+
+```powershell
+cargo test --release --locked
+```
+
+Optional isolated interop tests (against a local loopback official ClipCascade server on `127.0.0.1:18765` and the official Android app) are marked `#[ignore]` and require explicit opt-in environment variables (`CLIPCASCADE_ANDROID_INTEROP=1`, `CLIPCASCADE_P2P_TEST=1`, `CLIPCASCADE_P2S_TEST=1`).
+
+## License
+
+Licensed under the [GNU General Public License v3.0](LICENSE).
+Compatible with [Sathvik-Rao/ClipCascade](https://github.com/Sathvik-Rao/ClipCascade).
