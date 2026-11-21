@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::VecDeque,
     ffi::OsStr,
     fs,
@@ -78,7 +78,11 @@ const STATIC_NO_PREFIX: u32 = 0x80;
 const STATIC_ETCHED_LINE: u32 = 0x10;
 const STATIC_OWNER_DRAW: u32 = 0x0d;
 
-thread_local! { static DISPATCHING: Cell<bool> = const { Cell::new(false) }; }
+thread_local! {
+    static DISPATCHING: Cell<bool> = const { Cell::new(false) };
+    static TRAY_MENU_OPEN: Cell<bool> = const { Cell::new(false) };
+    static DEFERRED: RefCell<Vec<(u32, WPARAM, LPARAM)>> = const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
@@ -1467,52 +1471,111 @@ impl App {
         tray.uID = 1;
         tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         tray.uCallbackMessage = TRAY;
-        tray.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
+        tray.hIcon = load_app_icon(unsafe { GetSystemMetricsForDpi(SM_CXSMICON, self.dpi) });
         let title = wide("ClipCascade Lite");
         tray.szTip[..title.len()].copy_from_slice(&title);
         self.tray = unsafe { Shell_NotifyIconW(NIM_ADD, &tray) } != 0;
     }
 
-    fn tray_command(&mut self, message: u32) {
-        if message == WM_LBUTTONUP {
-            let _ = self.command(OPEN);
-        } else if matches!(message, WM_RBUTTONUP | WM_CONTEXTMENU) {
-            let command = unsafe {
-                let menu = CreatePopupMenu();
-                let mut point = POINT { x: 0, y: 0 };
-                GetCursorPos(&mut point);
-                AppendMenuW(menu, MF_STRING, OPEN, w!("メイン画面を開く"));
-                if let Some(active) = &self.active {
-                    AppendMenuW(
-                        menu,
-                        MF_STRING,
-                        PAUSE,
-                        if *active.paused.borrow() {
-                            w!("同期再開")
-                        } else {
-                            w!("一時停止")
-                        },
-                    );
-                    AppendMenuW(menu, MF_STRING, CONNECT, w!("切断"));
-                }
-                AppendMenuW(menu, MF_SEPARATOR, 0, null());
-                AppendMenuW(menu, MF_STRING, QUIT, w!("終了"));
-                SetForegroundWindow(self.window);
-                let command = TrackPopupMenu(
-                    menu,
-                    TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-                    point.x,
-                    point.y,
-                    0,
-                    self.window,
-                    null(),
-                );
-                DestroyMenu(menu);
-                command
-            };
-            if command != 0 {
-                let _ = self.command(command as usize);
+    fn apply_icons(&self) {
+        unsafe {
+            let big = load_app_icon(GetSystemMetricsForDpi(SM_CXICON, self.dpi));
+            let small = load_app_icon(GetSystemMetricsForDpi(SM_CXSMICON, self.dpi));
+            SendMessageW(self.window, WM_SETICON, ICON_BIG as usize, big as isize);
+            SendMessageW(self.window, WM_SETICON, ICON_SMALL as usize, small as isize);
+            if self.tray {
+                let mut tray: NOTIFYICONDATAW = zeroed();
+                tray.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+                tray.hWnd = self.window;
+                tray.uID = 1;
+                tray.uFlags = NIF_ICON;
+                tray.hIcon = small;
+                Shell_NotifyIconW(NIM_MODIFY, &tray);
             }
+        }
+    }
+
+    fn tray_menu_state(&self) -> (bool, bool) {
+        let connected = self.active.is_some();
+        let paused = self
+            .active
+            .as_ref()
+            .is_some_and(|active| *active.paused.borrow());
+        (connected, paused)
+    }
+}
+
+fn load_app_icon(size: i32) -> HICON {
+    unsafe {
+        let icon = LoadImageW(
+            GetModuleHandleW(null()),
+            std::ptr::without_provenance::<u16>(1),
+            IMAGE_ICON,
+            size,
+            size,
+            LR_DEFAULTCOLOR | LR_SHARED,
+        ) as HICON;
+        if !icon.is_null() {
+            return icon;
+        }
+        LoadIconW(null_mut(), IDI_APPLICATION)
+    }
+}
+
+fn show_tray_menu(window: HWND, connected: bool, paused: bool) -> i32 {
+    unsafe {
+        let menu = CreatePopupMenu();
+        let mut point = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut point);
+        AppendMenuW(menu, MF_STRING, OPEN, w!("メイン画面を開く"));
+        if connected {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                PAUSE,
+                if paused {
+                    w!("同期再開")
+                } else {
+                    w!("一時停止")
+                },
+            );
+            AppendMenuW(menu, MF_STRING, CONNECT, w!("切断"));
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(menu, MF_STRING, QUIT, w!("終了"));
+        SetForegroundWindow(window);
+        let command = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+            point.x,
+            point.y,
+            0,
+            window,
+            null(),
+        );
+        PostMessageW(window, WM_NULL, 0, 0);
+        DestroyMenu(menu);
+        command
+    }
+}
+
+fn defer_message(message: u32, wp: WPARAM, lp: LPARAM) {
+    DEFERRED.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        if matches!(message, EVENTS | WM_CLIPBOARDUPDATE)
+            && queue.iter().any(|&(m, _, _)| m == message)
+        {
+            return;
+        }
+        queue.push((message, wp, lp));
+    });
+}
+
+fn flush_deferred(window: HWND) {
+    let pending = DEFERRED.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+    unsafe {
+        for (message, wp, lp) in pending {
+            PostMessageW(window, message, wp, lp);
         }
     }
 }
@@ -1618,12 +1681,34 @@ extern "system" fn window_proc(window: HWND, message: u32, wp: WPARAM, lp: LPARA
         if DISPATCHING.get() {
             if matches!(
                 message,
-                WM_CLOSE | WM_COMMAND | WM_TIMER | WM_CLIPBOARDUPDATE | EVENTS | TRAY
+                WM_CLOSE | WM_COMMAND | WM_TIMER | WM_CLIPBOARDUPDATE | EVENTS
             ) {
-                PostMessageW(window, message, wp, lp);
+                defer_message(message, wp, lp);
+                return 0;
+            }
+            if message == TRAY {
                 return 0;
             }
             return DefWindowProcW(window, message, wp, lp);
+        }
+        if message == TRAY {
+            let event = lp as u32;
+            if matches!(event, WM_RBUTTONUP | WM_CONTEXTMENU) {
+                if TRAY_MENU_OPEN.get() {
+                    return 0;
+                }
+                let (connected, paused) = (*raw).tray_menu_state();
+                TRAY_MENU_OPEN.set(true);
+                let command = show_tray_menu(window, connected, paused);
+                TRAY_MENU_OPEN.set(false);
+                if command != 0 && GetWindowLongPtrW(window, GWLP_USERDATA) != 0 {
+                    PostMessageW(window, WM_COMMAND, command as usize, 0);
+                }
+                return 0;
+            }
+            if event != WM_LBUTTONUP {
+                return 0;
+            }
         }
         if message == WM_CLOSE || (message == WM_COMMAND && wp & 0xffff == QUIT) {
             DestroyWindow(window);
@@ -1631,38 +1716,53 @@ extern "system" fn window_proc(window: HWND, message: u32, wp: WPARAM, lp: LPARA
         }
         if message == WM_NCDESTROY {
             SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            DEFERRED.with(|queue| queue.borrow_mut().clear());
             drop(Box::from_raw(raw));
             PostQuitMessage(0);
             return DefWindowProcW(window, message, wp, lp);
         }
         DISPATCHING.set(true);
         let app = &mut *raw;
-        match message {
+        let result = match message {
             WM_COMMAND if wp & 0xffff == HISTORY_LIST && wp >> 16 == LBN_SELCHANGE as usize => {
                 app.show_history_selection();
+                Some(0)
             }
             WM_COMMAND if wp >> 16 == 0 => {
                 if let Err(error) = app.command(wp & 0xffff) {
                     app.detail(&format!("エラー · {error:#}"));
                 }
+                Some(0)
             }
-            WM_CLIPBOARDUPDATE => app.schedule_read(false),
+            WM_CLIPBOARDUPDATE => {
+                app.schedule_read(false);
+                Some(0)
+            }
             WM_TIMER if wp == READ_TIMER => {
                 KillTimer(window, READ_TIMER);
                 app.read_clipboard();
+                Some(0)
             }
-            EVENTS => app.drain(),
-            TRAY => app.tray_command(lp as u32),
+            EVENTS => {
+                app.drain();
+                Some(0)
+            }
+            TRAY => {
+                let _ = app.command(OPEN);
+                Some(0)
+            }
             WM_DRAWITEM if lp != 0 => {
                 let item = &*(lp as *const DRAWITEMSTRUCT);
                 if item.hwndItem == app.fields.history_image {
                     app.draw_history_image(item);
-                    DISPATCHING.set(false);
-                    return 1;
+                    Some(1)
+                } else {
+                    None
                 }
             }
             WM_DPICHANGED => {
                 app.rescale((wp & 0xffff) as u32);
+                app.apply_icons();
                 let rect = &*(lp as *const RECT);
                 SetWindowPos(
                     window,
@@ -1673,6 +1773,7 @@ extern "system" fn window_proc(window: HWND, message: u32, wp: WPARAM, lp: LPARA
                     rect.bottom - rect.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
+                Some(0)
             }
             msg if msg == app.taskbar_created => {
                 app.add_tray();
@@ -1680,14 +1781,16 @@ extern "system" fn window_proc(window: HWND, message: u32, wp: WPARAM, lp: LPARA
                 if !app.tray && IsWindowVisible(window) == 0 {
                     ShowWindow(window, SW_RESTORE);
                 }
+                Some(0)
             }
-            _ => {
-                DISPATCHING.set(false);
-                return DefWindowProcW(window, message, wp, lp);
-            }
-        }
+            _ => None,
+        };
         DISPATCHING.set(false);
-        0
+        flush_deferred(window);
+        match result {
+            Some(code) => code,
+            None => DefWindowProcW(window, message, wp, lp),
+        }
     }
 }
 
@@ -1733,7 +1836,7 @@ pub fn run() {
         }
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let instance = GetModuleHandleW(null());
-        let icon = LoadIconW(null_mut(), IDI_APPLICATION);
+        let icon = load_app_icon(GetSystemMetrics(SM_CXICON));
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
@@ -1803,6 +1906,7 @@ pub fn run() {
             return;
         }
         app.add_tray();
+        app.apply_icons();
         app.refresh();
         AddClipboardFormatListener(window);
         SetFocus(app.fields.server);
@@ -1823,6 +1927,19 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defer_message_deduplicates_events_and_loads_app_icon() {
+        DEFERRED.with(|q| q.borrow_mut().clear());
+        defer_message(EVENTS, 0, 0);
+        defer_message(EVENTS, 0, 0);
+        defer_message(WM_CLIPBOARDUPDATE, 0, 0);
+        defer_message(WM_CLIPBOARDUPDATE, 0, 0);
+        defer_message(WM_COMMAND, CONNECT, 0);
+        let items = DEFERRED.with(|q| std::mem::take(&mut *q.borrow_mut()));
+        assert_eq!(items.len(), 3);
+        assert!(!load_app_icon(32).is_null());
+    }
 
     #[test]
     fn single_instance_mutex_blocks_duplicate_acquisition() {
