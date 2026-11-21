@@ -4,6 +4,8 @@
 
 RustとWin32で作った、既存の [ClipCascade](https://github.com/Sathvik-Rao/ClipCascade) サーバーに接続する超軽量Windowsクライアントです。サーバーの設定に合わせてP2PとP2Sを自動で切り替えます。
 
+> **注意**：本ソフトウェアは第三者による**非公式（Unofficial）クライアント**です。公式の ClipCascade プロジェクトおよび開発者とは無関係であり、プロトコル互換の独立実装として作成しています。
+
 ## Windowsで使う
 
 1. `cargo build --release --locked` でビルドし、`target\release\clipcascade-lite.exe` を開きます。
