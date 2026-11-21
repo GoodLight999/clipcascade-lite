@@ -31,6 +31,7 @@ use windows_sys::{
         Graphics::Gdi::*,
         System::{
             DataExchange::*, LibraryLoader::GetModuleHandleW, SystemInformation::GetLocalTime,
+            Threading::CreateMutexW,
         },
         UI::{
             Controls::*,
@@ -46,6 +47,7 @@ use zeroize::Zeroizing;
 
 const TITLE: *const u16 = w!("ClipCascade Lite");
 const CLASS: *const u16 = w!("ClipCascadeLite.Main");
+const INSTANCE_MUTEX: *const u16 = w!("Local\\ClipCascadeLite.SingleInstance");
 const EVENTS: u32 = WM_APP + 1;
 const TRAY: u32 = WM_APP + 2;
 const READ_TIMER: usize = 1;
@@ -1689,8 +1691,41 @@ extern "system" fn window_proc(window: HWND, message: u32, wp: WPARAM, lp: LPARA
     }
 }
 
+struct SingleInstance(HANDLE);
+
+impl SingleInstance {
+    fn acquire(name: *const u16) -> Option<Self> {
+        unsafe {
+            let handle = CreateMutexW(null(), 0, name);
+            if handle.is_null() {
+                return None;
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                CloseHandle(handle);
+                return None;
+            }
+            Some(Self(handle))
+        }
+    }
+}
+
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
 pub fn run() {
     unsafe {
+        let Some(_single_instance) = SingleInstance::acquire(INSTANCE_MUTEX) else {
+            let existing = FindWindowW(CLASS, null());
+            if !existing.is_null() {
+                PostMessageW(existing, WM_COMMAND, OPEN, 0);
+            }
+            return;
+        };
         let existing = FindWindowW(CLASS, null());
         if !existing.is_null() {
             PostMessageW(existing, WM_COMMAND, OPEN, 0);
@@ -1788,6 +1823,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_instance_mutex_blocks_duplicate_acquisition() {
+        let name = wide(format!("Local\\ClipCascadeLite.Test.{}", uuid::Uuid::new_v4()));
+        let first = SingleInstance::acquire(name.as_ptr());
+        assert!(first.is_some());
+        assert!(SingleInstance::acquire(name.as_ptr()).is_none());
+        drop(first);
+        assert!(SingleInstance::acquire(name.as_ptr()).is_some());
+    }
 
     #[test]
     fn auto_connect_requires_server_username_and_remember_password() {

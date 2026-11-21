@@ -157,9 +157,9 @@ const CHANNEL_LABEL: &str = "cliptext";
 const PEER_LIMIT: usize = 32;
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const P2P_CHECK_INTERVAL: Duration = Duration::from_secs(3);
-const P2P_OFFER_TIMEOUT: Duration = Duration::from_secs(12);
+const P2P_OFFER_TIMEOUT: Duration = Duration::from_secs(18);
 const P2P_FAILURE_RETRY: Duration = Duration::from_secs(2);
-const P2P_REJOIN_AFTER: Duration = Duration::from_secs(25);
+const P2P_REJOIN_AFTER: Duration = Duration::from_secs(30);
 
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
