@@ -11,14 +11,113 @@ use std::{
     path::{Path, PathBuf},
     ptr,
 };
-use windows_sys::Win32::{
-    System::DataExchange::{
-        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+use windows_sys::{
+    Win32::{
+        Foundation::CloseHandle,
+        System::{
+            DataExchange::{
+                CloseClipboard, GetClipboardData, GetClipboardOwner, IsClipboardFormatAvailable,
+                OpenClipboard, RegisterClipboardFormatW,
+            },
+            Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+            Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+            },
+        },
+        UI::{Shell::DragQueryFileW, WindowsAndMessaging::GetWindowThreadProcessId},
     },
-    UI::Shell::DragQueryFileW,
+    w,
 };
 
 const DROP_FORMAT: u32 = 15;
+
+pub fn clipboard_owner_name() -> Option<String> {
+    unsafe {
+        let owner = GetClipboardOwner();
+        if owner.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(owner, &mut pid);
+        if pid == 0 {
+            return None;
+        }
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut buffer = vec![0u16; 512];
+        let mut len = buffer.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(handle);
+        if !ok || len == 0 {
+            return None;
+        }
+        let full = OsString::from_wide(&buffer[..len as usize]);
+        Path::new(&full)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    }
+}
+
+pub fn normalize_app_name(name: &str) -> String {
+    let trimmed = name.trim().to_ascii_lowercase();
+    trimmed
+        .strip_suffix(".exe")
+        .unwrap_or(&trimmed)
+        .trim()
+        .to_owned()
+}
+
+pub fn is_excluded_app(owner: &str, excluded_apps: &[String]) -> bool {
+    let owner = normalize_app_name(owner);
+    !owner.is_empty()
+        && excluded_apps
+            .iter()
+            .any(|entry| normalize_app_name(entry) == owner)
+}
+
+fn is_excluded_from_monitor() -> Result<bool> {
+    unsafe {
+        for name in [
+            w!("ExcludeClipboardContentFromMonitorProcessing"),
+            w!("Clipboard Viewer Ignore"),
+        ] {
+            let format = RegisterClipboardFormatW(name);
+            if format != 0 && IsClipboardFormatAvailable(format) != 0 {
+                return Ok(true);
+            }
+        }
+        let history = RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory"));
+        let cloud = RegisterClipboardFormatW(w!("CanUploadToCloudClipboard"));
+        let check_history = history != 0 && IsClipboardFormatAvailable(history) != 0;
+        let check_cloud = cloud != 0 && IsClipboardFormatAvailable(cloud) != 0;
+        if !check_history && !check_cloud {
+            return Ok(false);
+        }
+        let _clipboard = clipboard_win::Clipboard::new_attempts(3).map_err(|error| {
+            anyhow::anyhow!("クリップボードの同期許可を確認できません: {error}")
+        })?;
+        for (available, format) in [(check_history, history), (check_cloud, cloud)] {
+            if !available {
+                continue;
+            }
+            let handle = GetClipboardData(format);
+            ensure!(
+                !handle.is_null() && GlobalSize(handle) >= size_of::<u32>(),
+                "クリップボードの同期許可を読み取れません"
+            );
+            let data = GlobalLock(handle).cast::<u32>();
+            ensure!(!data.is_null(), "クリップボードの同期許可を読み取れません");
+            let allowed = data.read_unaligned() != 0;
+            GlobalUnlock(handle);
+            if !allowed {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
 
 enum Snapshot {
     Files(Vec<PathBuf>),
@@ -53,7 +152,30 @@ fn files() -> Result<Vec<PathBuf>> {
     }
 }
 
-pub fn read(sharing: Sharing) -> Result<Option<Content>> {
+pub fn read(
+    sharing: Sharing,
+    respect_exclusion: bool,
+    excluded_apps: &[String],
+) -> Result<Option<Content>> {
+    let owner = clipboard_owner_name();
+    if respect_exclusion {
+        let excluded_app = owner
+            .as_deref()
+            .is_some_and(|name| is_excluded_app(name, excluded_apps));
+        let excluded_format = is_excluded_from_monitor()?;
+        crate::diagnostic::debug(&format!(
+            "clipboard read owner={} excluded_format={excluded_format} excluded_app={excluded_app}",
+            owner.as_deref().unwrap_or("<none>")
+        ));
+        if excluded_format || excluded_app {
+            return Ok(None);
+        }
+    } else {
+        crate::diagnostic::debug(&format!(
+            "clipboard manual read owner={}",
+            owner.as_deref().unwrap_or("<none>")
+        ));
+    }
     let mut clipboard = Clipboard::new()?;
     let snapshot = if sharing.files && unsafe { IsClipboardFormatAvailable(DROP_FORMAT) != 0 } {
         Some(Snapshot::Files(files()?))

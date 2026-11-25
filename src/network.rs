@@ -1158,7 +1158,15 @@ impl<'a, R: Reporter> Mesh<'a, R> {
                     Err(e) => Err(e),
                 };
                 match result {
-                    Ok(Some(content)) => self.report.emit(Event::Received(content)),
+                    Ok(Some(content)) => {
+                        crate::diagnostic::debug(&format!(
+                            "p2p peer={} gen={generation} received {:?} bytes={}",
+                            short_id(id),
+                            content.kind(),
+                            content.size()
+                        ));
+                        self.report.emit(Event::Received(content));
+                    }
                     Err(e) => {
                         crate::diagnostic::debug(&format!(
                             "p2p peer={} gen={generation} recv error: {e:#}",

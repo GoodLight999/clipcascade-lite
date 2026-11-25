@@ -22,7 +22,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
-    time::{Duration, Instant},
 };
 use tokio::sync::{oneshot, watch};
 use windows_sys::{
@@ -51,7 +50,7 @@ const INSTANCE_MUTEX: *const u16 = w!("Local\\ClipCascadeLite.SingleInstance");
 const EVENTS: u32 = WM_APP + 1;
 const TRAY: u32 = WM_APP + 2;
 const READ_TIMER: usize = 1;
-const SAME_CLIPBOARD_BURST: Duration = Duration::from_millis(1500);
+const READ_DELAY_MS: u32 = 48;
 const OPEN: usize = 1;
 const CONNECT: usize = 101;
 const PAUSE: usize = 102;
@@ -72,7 +71,7 @@ const HISTORY_LIMIT: usize = 60;
 const LOG_LIMIT: usize = 300;
 const HISTORY_BYTES: usize = 16 * 1024 * 1024;
 const WIDTH: i32 = 660;
-const HEIGHT: i32 = 568;
+const HEIGHT: i32 = 624;
 const MIB: usize = 1024 * 1024;
 const STATIC_NO_PREFIX: u32 = 0x80;
 const STATIC_ETCHED_LINE: u32 = 0x10;
@@ -82,6 +81,27 @@ thread_local! {
     static DISPATCHING: Cell<bool> = const { Cell::new(false) };
     static TRAY_MENU_OPEN: Cell<bool> = const { Cell::new(false) };
     static DEFERRED: RefCell<Vec<(u32, WPARAM, LPARAM)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn default_excluded_apps() -> Vec<String> {
+    [
+        "Aqua Voice.exe",
+        "AquaWindowsBridge.exe",
+        "Wispr Flow.exe",
+        "Typeless.exe",
+        "Genspark Speakly.exe",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn parse_excluded_apps(raw: &str) -> Vec<String> {
+    raw.split([',', ';', '、'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 #[derive(Deserialize, Serialize)]
@@ -98,6 +118,8 @@ struct Profile {
     files: bool,
     limit_mib: usize,
     directory: String,
+    #[serde(default = "default_excluded_apps")]
+    excluded_apps: Vec<String>,
 }
 
 impl Default for Profile {
@@ -133,6 +155,7 @@ impl Default for Profile {
                 .join("ClipCascade Lite")
                 .to_string_lossy()
                 .into_owned(),
+            excluded_apps: default_excluded_apps(),
         }
     }
 }
@@ -195,6 +218,7 @@ enum UiEvent {
     Applied {
         epoch: u64,
         sequence: u32,
+        fingerprint: [u8; 32],
         kind: Kind,
         size: usize,
         result: Result<Option<PathBuf>>,
@@ -207,14 +231,16 @@ struct ClipboardSnapshot {
 }
 
 #[derive(Default)]
-struct ClipboardBurst(Option<([u8; 32], Instant)>);
+struct ClipboardBurst(Option<[u8; 32]>);
 
 impl ClipboardBurst {
-    fn should_send(&mut self, fingerprint: [u8; 32], manual: bool, now: Instant) -> bool {
-        let repeated = self.0.is_some_and(|(previous, at)| {
-            previous == fingerprint && now.duration_since(at) < SAME_CLIPBOARD_BURST
-        });
-        self.0 = Some((fingerprint, now));
+    fn record_applied(&mut self, fingerprint: [u8; 32]) {
+        self.0 = Some(fingerprint);
+    }
+
+    fn should_send(&mut self, fingerprint: [u8; 32], manual: bool) -> bool {
+        let repeated = self.0 == Some(fingerprint);
+        self.0 = Some(fingerprint);
         manual || !repeated
     }
 }
@@ -240,6 +266,7 @@ struct Active {
     paused: watch::Sender<bool>,
     cancel: oneshot::Sender<()>,
     sharing: Sharing,
+    excluded_apps: Arc<Vec<String>>,
     folder: PathBuf,
     pending_password: Option<(Target, Zeroizing<String>)>,
 }
@@ -258,6 +285,7 @@ struct Fields {
     files: HWND,
     limit: HWND,
     directory: HWND,
+    excluded_apps: HWND,
     connect: HWND,
     pause: HWND,
     send: HWND,
@@ -555,12 +583,28 @@ impl App {
         self.fields.files = self.check("ファイルを同期", 0, profile.files, [150, 438, 140, 24]);
         self.fields.directory =
             self.edit("受信ファイルの保存先", &profile.directory, 466, 24, 612, 0);
-        self.fields.connect = self.button("接続", CONNECT, [24, 527, 90, 30]);
-        self.fields.pause = self.button("一時停止", PAUSE, [120, 527, 88, 30]);
-        self.fields.send = self.button("今すぐ送信", SEND, [214, 527, 98, 30]);
-        self.button("保存先を開く", FOLDER, [318, 527, 108, 30]);
-        self.button("設定を保存", SAVE, [432, 527, 98, 30]);
-        self.fields.hide = self.button("トレイへ", HIDE, [536, 527, 100, 30]);
+        self.fields.excluded_apps = self.edit(
+            "同期から除外するアプリ（カンマ区切り・任意）",
+            &profile.excluded_apps.join(", "),
+            522,
+            24,
+            612,
+            0,
+        );
+        unsafe {
+            SendMessageW(
+                self.fields.excluded_apps,
+                EM_SETCUEBANNER,
+                0,
+                w!("Aqua Voice.exe, Wispr Flow.exe") as isize,
+            );
+        }
+        self.fields.connect = self.button("接続", CONNECT, [24, 583, 90, 30]);
+        self.fields.pause = self.button("一時停止", PAUSE, [120, 583, 88, 30]);
+        self.fields.send = self.button("今すぐ送信", SEND, [214, 583, 98, 30]);
+        self.button("保存先を開く", FOLDER, [318, 583, 108, 30]);
+        self.button("設定を保存", SAVE, [432, 583, 98, 30]);
+        self.fields.hide = self.button("トレイへ", HIDE, [536, 583, 100, 30]);
         let history = self.controls.len();
         self.label("この起動中の送受信", [24, 146, 300, 24], true);
         self.fields.history_list = self.create(
@@ -568,30 +612,30 @@ impl App {
             "",
             WS_TABSTOP | WS_BORDER | WS_VSCROLL | LBS_NOTIFY as u32,
             HISTORY_LIST,
-            [24, 181, 225, 323],
+            [24, 181, 225, 379],
             false,
         );
         self.fields.history_title = self.label("", [271, 181, 365, 32], false);
-        self.fields.history_text = self.readonly_edit([271, 215, 365, 289]);
+        self.fields.history_text = self.readonly_edit([271, 215, 365, 345]);
         self.fields.history_image = self.create(
             w!("STATIC"),
             "",
             STATIC_OWNER_DRAW,
             0,
-            [271, 215, 365, 289],
+            [271, 215, 365, 345],
             false,
         );
-        self.label("最大60件／16 MiB · 終了時に消去", [24, 533, 430, 22], false);
-        self.button("履歴を消去", CLEAR_HISTORY, [530, 527, 106, 30]);
+        self.label("最大60件／16 MiB · 終了時に消去", [24, 589, 430, 22], false);
+        self.button("履歴を消去", CLEAR_HISTORY, [530, 583, 106, 30]);
         let logs = self.controls.len();
         self.label("診断ログ", [24, 146, 300, 24], true);
-        self.fields.log = self.readonly_edit([24, 181, 612, 323]);
+        self.fields.log = self.readonly_edit([24, 181, 612, 379]);
         self.label(
             "最新300件 · ログは再起動後も確認できます",
-            [24, 533, 400, 22],
+            [24, 589, 400, 22],
             false,
         );
-        self.button("ログフォルダーを開く", OPEN_LOG_FOLDER, [447, 527, 189, 30]);
+        self.button("ログフォルダーを開く", OPEN_LOG_FOLDER, [447, 583, 189, 30]);
         self.pages = [
             connection..history,
             history..logs,
@@ -921,6 +965,7 @@ impl App {
             files: checked(f.files),
             limit_mib,
             directory,
+            excluded_apps: parse_excluded_apps(&get(f.excluded_apps)),
         })
     }
 
@@ -956,6 +1001,7 @@ impl App {
             None
         };
         let sharing = profile.sharing();
+        let excluded_apps = Arc::new(profile.excluded_apps);
         let folder = PathBuf::from(profile.directory);
         let mut settings = Settings {
             server: profile.server,
@@ -1003,6 +1049,7 @@ impl App {
             paused,
             cancel,
             sharing,
+            excluded_apps,
             folder,
             pending_password,
         });
@@ -1203,7 +1250,11 @@ impl App {
                 PostMessageW(self.window, WM_CLOSE, 0, 0);
             },
             SAVE => {
-                self.profile()?.save().context("設定を保存できません")?;
+                let profile = self.profile()?;
+                profile.save().context("設定を保存できません")?;
+                if let Some(active) = &mut self.active {
+                    active.excluded_apps = Arc::new(profile.excluded_apps);
+                }
                 self.detail("接続設定を保存しました");
             }
             ENCRYPTED => self.refresh(),
@@ -1226,7 +1277,7 @@ impl App {
             self.read_pending = true;
             self.manual_send |= force;
             unsafe {
-                SetTimer(self.window, READ_TIMER, 48, None);
+                SetTimer(self.window, READ_TIMER, READ_DELAY_MS, None);
             }
         }
     }
@@ -1250,15 +1301,18 @@ impl App {
         let reporter = self.reporter();
         let sequence = self.sequence;
         let sharing = active.sharing;
+        let excluded_apps = active.excluded_apps.clone();
+        let respect_exclusion = !self.manual_send;
         let thread = std::thread::Builder::new()
             .name("clipcascade-clipboard".into())
             .spawn(move || {
-                let result = clipboard::read(sharing).map(|content| {
-                    content.map(|content| ClipboardSnapshot {
-                        fingerprint: content.fingerprint(),
-                        content,
-                    })
-                });
+                let result =
+                    clipboard::read(sharing, respect_exclusion, &excluded_apps).map(|content| {
+                        content.map(|content| ClipboardSnapshot {
+                            fingerprint: content.fingerprint(),
+                            content,
+                        })
+                    });
                 reporter.post(UiEvent::Clipboard { sequence, result });
             });
         if thread.is_err() {
@@ -1288,6 +1342,7 @@ impl App {
         let before = unsafe { GetClipboardSequenceNumber() };
         let kind = content.kind();
         let size = content.size();
+        let fingerprint = content.fingerprint();
         self.apply_in_progress = true;
         set(
             self.fields.detail,
@@ -1308,6 +1363,7 @@ impl App {
                 reporter.post(UiEvent::Applied {
                     epoch,
                     sequence,
+                    fingerprint,
                     kind,
                     size,
                     result,
@@ -1394,6 +1450,7 @@ impl App {
                 UiEvent::Applied {
                     epoch,
                     sequence,
+                    fingerprint,
                     kind,
                     size,
                     result,
@@ -1409,6 +1466,7 @@ impl App {
                                 }
                                 self.sequence = sequence;
                                 self.read_pending = false;
+                                self.clipboard_burst.record_applied(fingerprint);
                                 self.detail(&format!("受信 · {} · {} バイト", kind.label(), size));
                             }
                             Err(error) => {
@@ -1440,11 +1498,9 @@ impl App {
                         let manual = std::mem::take(&mut self.manual_send);
                         match result {
                             Ok(Some(snapshot))
-                                if self.clipboard_burst.should_send(
-                                    snapshot.fingerprint,
-                                    manual,
-                                    Instant::now(),
-                                ) =>
+                                if self
+                                    .clipboard_burst
+                                    .should_send(snapshot.fingerprint, manual) =>
                             {
                                 active
                                     .outgoing
@@ -1929,6 +1985,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn excluded_apps_defaults_parsing_and_matching_behave_cleanly() -> Result<()> {
+        let from_legacy: Profile = serde_json::from_str(r#"{"server":"https://example.invalid"}"#)?;
+        assert!(clipboard::is_excluded_app(
+            "Aqua Voice.exe",
+            &from_legacy.excluded_apps
+        ));
+        assert!(clipboard::is_excluded_app(
+            "AquaWindowsBridge.exe",
+            &from_legacy.excluded_apps
+        ));
+        let cleared: Profile = serde_json::from_str(r#"{"excluded_apps":[]}"#)?;
+        assert!(cleared.excluded_apps.is_empty());
+        assert!(!clipboard::is_excluded_app(
+            "AquaWindowsBridge.exe",
+            &cleared.excluded_apps
+        ));
+
+        let parsed = parse_excluded_apps(" Aqua Voice.exe , Wispr Flow ; Typeless、 ");
+        assert_eq!(parsed, ["Aqua Voice.exe", "Wispr Flow", "Typeless"]);
+        assert!(clipboard::is_excluded_app("aqua voice.exe", &parsed));
+        assert!(clipboard::is_excluded_app("Wispr Flow.exe", &parsed));
+        assert!(!clipboard::is_excluded_app("notepad.exe", &parsed));
+        Ok(())
+    }
+
+    #[test]
     fn defer_message_deduplicates_events_and_loads_app_icon() {
         DEFERRED.with(|q| q.borrow_mut().clear());
         defer_message(EVENTS, 0, 0);
@@ -1966,16 +2048,17 @@ mod tests {
     #[test]
     fn automatic_copy_collapses_matching_content_bursts() {
         let mut burst = ClipboardBurst::default();
-        let start = Instant::now();
         let a = Content::Text("abcd".into()).fingerprint();
         let b = Content::Text("wxyz".into()).fingerprint();
-        assert!(burst.should_send(a, false, start));
-        assert!(!burst.should_send(a, false, start + Duration::from_millis(80)));
-        assert!(!burst.should_send(a, false, start + Duration::from_millis(400)));
-        assert!(burst.should_send(b, false, start + Duration::from_millis(450)));
-        assert!(burst.should_send(a, false, start + Duration::from_millis(500)));
-        assert!(burst.should_send(a, true, start + Duration::from_millis(550)));
-        assert!(burst.should_send(a, false, start + Duration::from_millis(2500)));
+        let c = Content::Text("recv".into()).fingerprint();
+        assert!(burst.should_send(a, false));
+        assert!(!burst.should_send(a, false));
+        assert!(burst.should_send(b, false));
+        assert!(burst.should_send(a, false));
+        assert!(burst.should_send(a, true));
+        assert!(!burst.should_send(a, false));
+        burst.record_applied(c);
+        assert!(!burst.should_send(c, false));
     }
 
     #[test]
